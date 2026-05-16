@@ -1,0 +1,49 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: sarathi-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sarathi
+    ports:
+      - "5432:5432"
+    volumes:
+      - sarathi_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sarathi"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: sarathi-backend
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/sarathi
+      PGCONNECT_TIMEOUT: "10"
+      BGE_LOCAL_FILES_ONLY: "1"
+      SARATHI_PORTALS_CONFIG: portals.example.json
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: sarathi-frontend
+    environment:
+      SARATHI_API_URL: http://backend:8000
+    ports:
+      - "8502:8501"
+    depends_on:
+      - backend
+
+volumes:
+  sarathi_pgdata:

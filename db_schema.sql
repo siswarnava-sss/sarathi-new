@@ -29,3 +29,12 @@ ON government_schemes USING GIN (category);
 CREATE INDEX IF NOT EXISTS government_schemes_embedding_idx
 ON government_schemes USING ivfflat (embedding vector_cosine_ops)
 WITH (lists = 100);
+
+CREATE TABLE IF NOT EXISTS app_users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    profile JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at TIMESTAMPTZ
+);

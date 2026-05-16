@@ -136,7 +136,13 @@ async def scrape_india_gov_schemes(
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
-        page = await browser.new_page()
+        page = await browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0 Safari/537.36"
+            )
+        )
         try:
             await page.goto(url, wait_until="networkidle", timeout=60000)
             html = await page.content()
@@ -146,6 +152,10 @@ async def scrape_india_gov_schemes(
             await browser.close()
 
     soup = BeautifulSoup(html, "html.parser")
+    page_text = soup.get_text(" ", strip=True).lower()
+    if "access denied" in page_text and "permission to access" in page_text:
+        raise ScrapeError("India.gov.in blocked the scraper with an Access Denied response.")
+
     featured_heading = soup.find(
         lambda tag: tag.name in {"h2", "h3"} and "featured schemes" in tag.get_text(" ", strip=True).lower()
     )

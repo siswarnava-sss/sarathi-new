@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
 import re
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -10,6 +13,55 @@ from typing import Any, Iterable
 
 DEFAULT_MODEL_NAME = os.getenv("BGE_MODEL_NAME", "BAAI/bge-m3")
 DEFAULT_EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
+DEFAULT_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/sarathi"
+
+INTENT_TERMS: dict[str, dict[str, tuple[str, ...]]] = {
+    "medical_health": {
+        "need": ("health", "medical", "mediclaim", "hospital", "treatment", "insurance", "ayushman"),
+        "positive": (
+            "health insurance",
+            "medical",
+            "mediclaim",
+            "hospital",
+            "treatment",
+            "healthcare",
+            "ayushman",
+            "disease",
+            "patient",
+        ),
+        "negative": (
+            "soil health",
+            "plant health",
+            "crop",
+            "crops",
+            "agri",
+            "agriculture",
+            "farmer",
+            "farmers",
+            "animal",
+            "animals",
+            "fodder",
+            "livestock",
+        ),
+    },
+    "farming": {
+        "need": ("farming", "farmer", "agriculture", "crop", "kisan", "livestock"),
+        "positive": (
+            "agri",
+            "agriculture",
+            "farmer",
+            "farmers",
+            "crop",
+            "crops",
+            "kisan",
+            "soil health",
+            "livestock",
+            "animal husbandry",
+            "fodder",
+        ),
+        "negative": ("mediclaim", "hospital", "patient", "medical treatment"),
+    },
+}
 
 
 def _clean_text(value: Any, fallback: str = "") -> str:
@@ -116,7 +168,8 @@ class BGEEmbedder:
         if self._model is None:
             from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(self.model_name)
+            local_files_only = os.getenv("BGE_LOCAL_FILES_ONLY", "1").lower() not in {"0", "false", "no"}
+            self._model = SentenceTransformer(self.model_name, local_files_only=local_files_only)
         return self._model
 
     def embed(self, texts: str | Iterable[str]) -> list[float] | list[list[float]]:
@@ -130,7 +183,7 @@ class BGEEmbedder:
 
 class SchemeStore:
     def __init__(self, database_url: str | None = None, embedding_dim: int = DEFAULT_EMBEDDING_DIM) -> None:
-        self.database_url = database_url or os.getenv("DATABASE_URL")
+        self.database_url = database_url or os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
         self.embedding_dim = embedding_dim
 
     @property
@@ -165,6 +218,56 @@ class SchemeStore:
         self.initialize()
         with self._connect() as conn:
             return int(conn.execute("SELECT count(*) FROM government_schemes;").fetchone()[0])
+
+    def user_exists(self, username: str) -> bool:
+        if not self.enabled:
+            return False
+        self.initialize()
+        with self._connect(register_vectors=False) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM app_users WHERE username = %s;",
+                (username,),
+            ).fetchone()
+        return row is not None
+
+    def create_user(self, username: str, password: str, profile: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        self.initialize()
+        salt = secrets.token_hex(16)
+        password_hash = _hash_password(password, salt)
+        with self._connect(register_vectors=False) as conn:
+            conn.execute(
+                """
+                INSERT INTO app_users (username, password_hash, salt, profile)
+                VALUES (%s, %s, %s, %s::jsonb);
+                """,
+                (username, password_hash, salt, json.dumps(profile)),
+            )
+
+    def authenticate_user(self, username: str, password: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        self.initialize()
+        with self._connect(register_vectors=False) as conn:
+            row = conn.execute(
+                """
+                SELECT password_hash, salt, profile
+                FROM app_users
+                WHERE username = %s;
+                """,
+                (username,),
+            ).fetchone()
+            if not row:
+                return None
+            password_hash, salt, profile = row
+            if not hmac.compare_digest(password_hash, _hash_password(password, salt)):
+                return None
+            conn.execute(
+                "UPDATE app_users SET last_login_at = now() WHERE username = %s;",
+                (username,),
+            )
+        return dict(profile)
 
     def upsert_many(self, schemes: list[dict[str, Any]], embedder: BGEEmbedder | None = None) -> None:
         if not self.enabled:
@@ -253,6 +356,16 @@ class SchemeStore:
         return [dict(zip(columns, row)) for row in rows]
 
 
+def _hash_password(password: str, salt: str) -> str:
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        100_000,
+    )
+    return digest.hex()
+
+
 def deterministic_filter(schemes: list[dict[str, Any]], profile: CitizenProfile) -> list[dict[str, Any]]:
     matches: list[dict[str, Any]] = []
     category = profile.category.lower()
@@ -280,6 +393,64 @@ def lexical_score(query: str, scheme: dict[str, Any]) -> float:
     return len(query_terms & doc_terms) / len(query_terms)
 
 
+def _scheme_text(scheme: dict[str, Any]) -> str:
+    return " ".join(
+        [
+            _clean_text(scheme.get("name")),
+            _clean_text(scheme.get("description")),
+            _clean_text(scheme.get("search_text")),
+            _clean_text(scheme.get("source_portal")),
+            _clean_text(scheme.get("source_url")),
+        ]
+    ).lower()
+
+
+def profile_intent(profile: CitizenProfile) -> str | None:
+    need = profile.need.lower()
+    for intent, terms in INTENT_TERMS.items():
+        if any(term in need for term in terms["need"]):
+            return intent
+    return None
+
+
+def intent_score(profile: CitizenProfile, scheme: dict[str, Any]) -> float:
+    intent = profile_intent(profile)
+    if not intent:
+        return 0.0
+
+    text = _scheme_text(scheme)
+    terms = INTENT_TERMS[intent]
+    positive = intent_positive_count(profile, scheme)
+    negative = sum(1 for term in terms["negative"] if term in text)
+    score = min(positive, 4) * 0.35
+    if positive == 0 and negative:
+        score -= 1.25
+    else:
+        score -= min(negative, 3) * 0.2
+    return score
+
+
+def intent_positive_count(profile: CitizenProfile, scheme: dict[str, Any]) -> int:
+    intent = profile_intent(profile)
+    if not intent:
+        return 0
+    text = _scheme_text(scheme)
+    return sum(1 for term in INTENT_TERMS[intent]["positive"] if term in text)
+
+
+def relevance_score(profile: CitizenProfile, scheme: dict[str, Any]) -> float:
+    semantic = float(scheme.get("semantic_score") or 0.0)
+    lexical = lexical_score(profile.query_text(), scheme)
+    return semantic + lexical + intent_score(profile, scheme)
+
+
+def rerank_schemes(profile: CitizenProfile, schemes: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    intent = profile_intent(profile)
+    if intent:
+        schemes = [scheme for scheme in schemes if intent_positive_count(profile, scheme) > 0]
+    return sorted(schemes, key=lambda item: relevance_score(profile, item), reverse=True)[:limit]
+
+
 class HybridRetriever:
     def __init__(self, json_path: str | Path = "schemes.json") -> None:
         self.json_path = json_path
@@ -293,17 +464,103 @@ class HybridRetriever:
         except Exception:
             query_embedding = None
 
+        db_was_available = self.store.enabled
         if self.store.enabled:
             try:
-                results = self.store.hybrid_search(profile, query_embedding, limit=limit)
+                candidate_limit = max(limit * 6, 30)
+                results = self.store.hybrid_search(profile, query_embedding, limit=candidate_limit)
                 if results:
-                    return results, "PostgreSQL + pgvector hybrid retrieval"
+                    ranked = rerank_schemes(profile, results, limit)
+                    if ranked:
+                        return ranked, "PostgreSQL + pgvector hybrid retrieval + intent reranking"
             except Exception:
                 pass
 
-        schemes = deterministic_filter(load_json_schemes(self.json_path), profile)
-        ranked = sorted(schemes, key=lambda item: lexical_score(profile.query_text(), item), reverse=True)
-        return ranked[:limit], "local JSON deterministic filter with lexical ranking"
+        scraped = self._scrape_on_miss(profile, limit=limit)
+        if scraped:
+            mode = "live website scrape fallback"
+            if db_was_available:
+                mode = "PostgreSQL miss + live website scrape fallback"
+            return scraped, mode
+
+        seeded = self._seed_curated_schemes(profile, limit=limit)
+        if seeded:
+            return seeded, "curated sample seed fallback with intent reranking"
+
+        return [], "no grounded results - AI chatbot fallback"
+
+    def _scrape_on_miss(self, profile: CitizenProfile, limit: int) -> list[dict[str, Any]]:
+        if os.getenv("SARATHI_SCRAPE_ON_MISS", "1").lower() in {"0", "false", "no"}:
+            return []
+
+        scrape_limit = _clean_int(os.getenv("SARATHI_SCRAPE_ON_MISS_LIMIT"), max(limit, 8))
+        scrape_limit = max(1, min(scrape_limit, 25))
+        scraped: list[dict[str, Any]] = []
+
+        try:
+            from .scraper import (
+                PortalConfig,
+                scrape_india_gov_schemes_sync,
+                scrape_myscheme_pages_sync,
+                scrape_portal_sync,
+            )
+        except Exception:
+            return []
+
+        scrapers = [
+            lambda: scrape_myscheme_pages_sync(limit=scrape_limit, max_scrolls=4),
+            lambda: scrape_india_gov_schemes_sync(limit=scrape_limit),
+        ]
+        scrapers.extend(self._configured_portal_scrapers(PortalConfig, scrape_portal_sync, scrape_limit))
+
+        for scrape in scrapers:
+            try:
+                scraped.extend(scrape())
+            except Exception:
+                continue
+
+        if not scraped:
+            return []
+
+        unique_by_id = {scheme["id"]: normalize_scheme(scheme) for scheme in scraped}
+        normalized = list(unique_by_id.values())
+        if self.store.enabled:
+            try:
+                self.store.upsert_many(normalized, embedder=None)
+            except Exception:
+                pass
+
+        matches = deterministic_filter(normalized, profile)
+        return rerank_schemes(profile, matches, limit)
+
+    def _configured_portal_scrapers(self, portal_config: Any, scrape_portal: Any, limit: int) -> list[Any]:
+        config_path = Path(os.getenv("SARATHI_PORTALS_CONFIG", "portals.example.json"))
+        if not config_path.exists():
+            return []
+        try:
+            configs = json.loads(config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+        return [
+            lambda item=item: scrape_portal(portal_config(**item), limit=limit)
+            for item in configs
+            if isinstance(item, dict)
+        ]
+
+    def _seed_curated_schemes(self, profile: CitizenProfile, limit: int) -> list[dict[str, Any]]:
+        try:
+            curated = load_json_schemes(self.json_path)[:15]
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+        if self.store.enabled:
+            try:
+                self.store.upsert_many(curated, embedder=None)
+            except Exception:
+                pass
+
+        matches = deterministic_filter(curated, profile)
+        return rerank_schemes(profile, matches, limit)
 
 
 class GeminiExplainer:
@@ -313,7 +570,7 @@ class GeminiExplainer:
 
     def explain(self, profile: CitizenProfile, schemes: list[dict[str, Any]]) -> str:
         if not schemes:
-            return "I could not find a grounded match for this profile. Try widening the state, category, or income criteria."
+            return self._general_recommendations(profile)
         if not self.api_key:
             return self._fallback(profile, schemes)
         try:
@@ -345,8 +602,67 @@ Citizen profile:
 Grounded retrieved schemes:
 {grounded}
 
-Return concise, personalized recommendations in Markdown.
+        Return concise, personalized recommendations in Markdown.
 """
+
+    def _general_recommendations(self, profile: CitizenProfile) -> str:
+        if not self.api_key:
+            return self._general_fallback(profile)
+        try:
+            import google.generativeai as genai
+
+            genai.configure(api_key=self.api_key)
+            model = genai.GenerativeModel(self.model_name)
+            response = model.generate_content(self._general_prompt(profile))
+            return response.text.strip()
+        except Exception:
+            return self._general_fallback(profile)
+
+    def _general_prompt(self, profile: CitizenProfile) -> str:
+        return f"""
+You are Sarathi, a government scheme assistant. No verified local scheme rows matched this citizen.
+Give general, non-final recommendations for likely Indian government scheme categories to check.
+Do not invent exact eligibility, benefit amounts, deadlines, or application links.
+Tell the user to verify details on official portals such as myScheme, National Health Authority,
+National Scholarship Portal, state government portals, or the relevant ministry website.
+
+Citizen profile:
+- Age: {profile.age}
+- Gender: {profile.gender}
+- State: {profile.state}
+- Category: {profile.category}
+- Annual family income: INR {profile.income}
+- Stated need: {profile.need or "Not specified"}
+
+Return concise Markdown with 3-5 likely directions and what documents/details to verify.
+"""
+
+    def _general_fallback(self, profile: CitizenProfile) -> str:
+        need = profile.need.lower()
+        if any(term in need for term in ("health", "medical", "mediclaim", "hospital", "insurance", "ayushman")):
+            focus = [
+                "Ayushman Bharat / PM-JAY or your state's health assurance scheme",
+                "state health insurance or cashless treatment schemes",
+                "accident and life insurance schemes for low-income households",
+            ]
+        elif any(term in need for term in ("farming", "farmer", "agriculture", "crop", "kisan")):
+            focus = [
+                "PM-KISAN or state farmer income-support schemes",
+                "crop insurance and disaster compensation schemes",
+                "agriculture equipment, irrigation, and credit subsidy schemes",
+            ]
+        else:
+            focus = [
+                "central schemes on myScheme.gov.in for your stated need",
+                "your state government's welfare portal",
+                "scholarship, insurance, housing, employment, or business-support schemes based on your need",
+            ]
+        items = "\n".join(f"- {item}" for item in focus)
+        return (
+            "I could not find a verified local match yet, so treat these as general directions to verify on official portals:\n"
+            f"{items}\n\n"
+            "Keep Aadhaar, income certificate, caste/category certificate if applicable, bank details, and state residency proof ready."
+        )
 
     def _fallback(self, profile: CitizenProfile, schemes: list[dict[str, Any]]) -> str:
         lines = [
