@@ -1,0 +1,17 @@
+[
+  {
+    "name": "Replace With Real Portal",
+    "url": "https://www.india.gov.in/my-government/schemes",
+    "card_selector": ".scheme-card",
+    "name_selector": ".scheme-title",
+    "description_selector": ".scheme-description",
+    "apply_selector": "a",
+    "state": "All",
+    "gender": "All",
+    "category": "General,OBC,SC,ST",
+    "age_min": 0,
+    "age_max": 120,
+    "income_limit_inr": 9999999,
+    "language": "en"
+  }
+]
